@@ -1,0 +1,244 @@
+// converted to typescript - need to test it
+import clone from "clone";
+import { EventEmitter } from 'events';
+// updated node cache to typescript for my own use
+interface NodeCacheOptions {
+    forceString?: boolean;
+    objectValueSize?: number;
+    promiseValueSize?: number;
+    arrayValueSize?: number;
+    stdTTL?: number;
+    checkperiod?: number;
+    useClones?: boolean;
+    deleteOnExpire?: boolean;
+    enableLegacyCallbacks?: boolean;
+    maxKeys?: number;
+}
+
+interface Stats {
+    hits: number;
+    misses: number;
+    keys: number;
+    ksize: number;
+    vsize: number;
+}
+
+interface CacheValue {
+    t: number;
+    v: any;
+}
+
+class NodeCache extends EventEmitter {
+    private data: Record<string | number, CacheValue> = {};
+    private options: NodeCacheOptions;
+    private stats: Stats = { hits: 0, misses: 0, keys: 0, ksize: 0, vsize: 0 };
+    private validKeyTypes: Array<string> = ["string", "number"];
+    private checkTimeout?: NodeJS.Timeout;
+
+    constructor(options: NodeCacheOptions = {}) {
+        super();
+        this.options = {
+            forceString: false,
+            objectValueSize: 80,
+            promiseValueSize: 80,
+            arrayValueSize: 40,
+            stdTTL: 0,
+            checkperiod: 600,
+            useClones: true,
+            deleteOnExpire: true,
+            enableLegacyCallbacks: false,
+            maxKeys: -1,
+            ...options
+        };
+
+        if (this.options.enableLegacyCallbacks) {
+            console.warn("WARNING! node-cache legacy callback support will drop in v6.x");
+            ["get", "mget", "set", "del", "ttl", "getTtl", "keys", "has"].forEach((methodKey) => {
+                const oldMethod = this[methodKey as keyof NodeCache];
+                this[methodKey as keyof NodeCache] = (...args: any[]) => {
+                    const callback = args.pop();
+                    if (typeof callback === "function") {
+                        try {
+                            const result = (oldMethod as any).apply(this, args);
+                            callback(null, result);
+                        } catch (err) {
+                            callback(err);
+                        }
+                    } else {
+                        return (oldMethod as any).apply(this, [...args, callback]);
+                    }
+                };
+            });
+        }
+
+        this._checkData();
+    }
+
+    get(key: string | number): any {
+        const err = this._isInvalidKey(key);
+        if (err) throw err;
+
+        if (this.data[key] && this._check(key, this.data[key])) {
+            this.stats.hits++;
+            return this._unwrap(this.data[key]);
+        } else {
+            this.stats.misses++;
+            return undefined;
+        }
+    }
+
+    mget(keys: Array<string | number>): Record<string | number, any> {
+        if (!Array.isArray(keys)) throw new Error("Keys must be an array");
+
+        const results: Record<string | number, any> = {};
+        keys.forEach(key => {
+            const err = this._isInvalidKey(key);
+            if (err) throw err;
+
+            if (this.data[key] && this._check(key, this.data[key])) {
+                this.stats.hits++;
+                results[key] = this._unwrap(this.data[key]);
+            } else {
+                this.stats.misses++;
+            }
+        });
+
+        return results;
+    }
+
+    set(key: string | number, value: any, ttl?: number): boolean {
+        if (this.options.maxKeys! > -1 && this.stats.keys >= this.options.maxKeys!) throw new Error("Cache full");
+
+        if (this.options.forceString && typeof value !== "string") value = JSON.stringify(value);
+
+        ttl = ttl ?? this.options.stdTTL;
+
+        const err = this._isInvalidKey(key);
+        if (err) throw err;
+
+        let existent = false;
+        if (this.data[key]) {
+            existent = true;
+            this.stats.vsize -= this._getValLength(this._unwrap(this.data[key], false));
+        }
+
+        this.data[key] = this._wrap(value, ttl!);
+        this.stats.vsize += this._getValLength(value);
+
+        if (!existent) {
+            this.stats.ksize += this._getKeyLength(key);
+            this.stats.keys++;
+        }
+
+        this.emit("set", key, value);
+        return true;
+    }
+
+    del(keys: string | number | Array<string | number>): number {
+        if (!Array.isArray(keys)) keys = [keys];
+
+        let delCount = 0;
+        keys.forEach(key => {
+            const err = this._isInvalidKey(key);
+            if (err) throw err;
+
+            if (this.data[key]) {
+                this.stats.vsize -= this._getValLength(this._unwrap(this.data[key], false));
+                this.stats.ksize -= this._getKeyLength(key);
+                this.stats.keys--;
+                delCount++;
+                const oldVal = this.data[key];
+                delete this.data[key];
+                this.emit("del", key, oldVal.v);
+            }
+        });
+
+        return delCount;
+    }
+
+    has(key: string | number): boolean {
+        return !!this.data[key] && this._check(key, this.data[key]);
+    }
+
+    keys(): Array<string | number> {
+        return Object.keys(this.data);
+    }
+
+    getStats(): Stats {
+        return this.stats;
+    }
+
+    flushAll(startPeriod = true): void {
+        this.data = {};
+        this.stats = { hits: 0, misses: 0, keys: 0, ksize: 0, vsize: 0 };
+        if (startPeriod) this._checkData(true);
+        this.emit("flush");
+    }
+
+    private _checkData(startPeriod = true): void {
+        Object.keys(this.data).forEach(key => {
+            this._check(key, this.data[key]);
+        });
+
+        if (startPeriod && this.options.checkperiod! > 0) {
+            this.checkTimeout = setTimeout(() => this._checkData(true), this.options.checkperiod! * 1000);
+        }
+    }
+
+    private _killCheckPeriod(): void {
+        if (this.checkTimeout) clearTimeout(this.checkTimeout);
+    }
+
+    private _check(key: string | number, data: CacheValue): boolean {
+        if (data.t !== 0 && data.t < Date.now()) {
+            if (this.options.deleteOnExpire) {
+                this.del(key);
+                return false;
+            }
+            this.emit("expired", key, this._unwrap(data));
+        }
+        return true;
+    }
+
+    private _isInvalidKey(key: string | number): Error | null {
+        if (!this.validKeyTypes.includes(typeof key)) {
+            return new Error("Invalid key type");
+        }
+        return null;
+    }
+
+    private _wrap(value: any, ttl: number, asClone = true): CacheValue {
+        let now = Date.now();
+        let livetime = ttl === 0 ? 0 : now + (ttl * 1000);
+        return { t: livetime, v: asClone && this.options.useClones ? clone(value) : value };
+    }
+
+    private _unwrap(value: CacheValue, asClone = true): any {
+        return asClone && this.options.useClones ? clone(value.v) : value.v;
+    }
+
+    private _getKeyLength(key: string | number): number {
+        return key.toString().length;
+    }
+
+    private _getValLength(value: any): number {
+        if (typeof value === "string") {
+            return value.length;
+        } else if (Array.isArray(value)) {
+            return value.length * this.options.arrayValueSize!;
+        } else if (typeof value === "number" || typeof value === "boolean") {
+            return 8; // Assuming 64-bit numbers and boolean
+        } else if (value && typeof value === "object") {
+            if (this.options.forceString) {
+                return JSON.stringify(value).length;
+            } else {
+                return Object.keys(value).length * this.options.objectValueSize!;
+            }
+        } else {
+            return 0;
+        }
+    }
+}
+
+export default NodeCache;
+
